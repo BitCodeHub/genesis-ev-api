@@ -274,6 +274,7 @@ def get_chargers_nrel(lat, lon, radius_miles=10, limit=20):
             "longitude": lon,
             "radius": radius_miles,
             "fuel_type": "ELEC",
+            "ev_connector_types": "J1772COMBO CHADEMO",
             "status": "E",
             "limit": limit,
         }
@@ -285,6 +286,34 @@ def get_chargers_nrel(lat, lon, radius_miles=10, limit=20):
             logger.warning("NREL rate limited")
     except Exception as e:
         logger.warning(f"NREL failed: {e}")
+    return None, None
+
+def get_chargers_nrel_route(waypoints, distance_miles=5):
+    """Single NREL call for the whole route using nearby-route endpoint."""
+    # Sample waypoints to build WKT
+    step = max(1, len(waypoints) // 15)
+    sampled = waypoints[::step]
+    coords_str = ", ".join(f"{lon} {lat}" for lat, lon in sampled)
+    wkt = f"LINESTRING({coords_str})"
+    try:
+        params = {
+            "api_key": NREL_KEY,
+            "route": wkt,
+            "distance": distance_miles,
+            "fuel_type": "ELEC",
+            "ev_connector_types": "J1772COMBO CHADEMO",
+            "status": "E",
+            "limit": 100,
+        }
+        resp = requests.get(f"{NREL_BASE}/nearby-route.json", params=params, timeout=20)
+        if resp.status_code == 200:
+            stations = resp.json().get("alt_fuel_stations", resp.json().get("fuel_stations", []))
+            logger.info(f"NREL route query returned {len(stations)} stations")
+            return stations, "nrel"
+        elif resp.status_code == 429:
+            logger.warning("NREL rate limited on route query")
+    except Exception as e:
+        logger.warning(f"NREL route query failed: {e}")
     return None, None
 
 def get_chargers_overpass(lat, lon, radius_m=16000):
@@ -380,36 +409,40 @@ def plan_route(orig_lat, orig_lon, dest_lat, dest_lon, start_soc_pct,
     )
     energy_per_km = total_kwh / total_dist_km if total_dist_km > 0 else 0.20
 
-    # 4. Chargers near route (NREL first, Overpass fallback)
-    # Sample waypoints for charger lookup at midpoints along route
-    sample_points = []
-    step = max(1, len(waypoints) // 8)
-    for i in range(0, len(waypoints), step):
-        sample_points.append(waypoints[i])
-
+    # 4. Chargers near route — single NREL nearby-route call, Overpass fallback
     charger_set = {}
-    for wlat, wlon in sample_points:
-        stations, source = get_chargers_nrel(wlat, wlon, radius_miles=8, limit=10)
-        if stations is None:
-            stations, source = get_chargers_overpass(wlat, wlon, radius_m=13000)
-        for s in (stations or []):
-            sid = s.get("id") or s.get("name")
-            if sid and sid not in charger_set:
-                charger_set[sid] = _normalize_nrel_station(s, wlat, wlon)
+    stations, source = get_chargers_nrel_route(waypoints, distance_miles=5)
+    if stations is None:
+        # Overpass fallback: query midpoint of route
+        mid_wp = waypoints[len(waypoints) // 2]
+        stations, source = get_chargers_overpass(mid_wp[0], mid_wp[1], radius_m=80000)
+        # Also query near origin and destination
+        for fallback_pt in [waypoints[0], waypoints[-1]]:
+            extra, _ = get_chargers_overpass(fallback_pt[0], fallback_pt[1], radius_m=50000)
+            stations = (stations or []) + (extra or [])
 
-    # Filter to DCFC only and within corridor (rough bounding box)
-    min_lat = min(orig_lat, dest_lat) - 0.5
-    max_lat = max(orig_lat, dest_lat) + 0.5
-    min_lon = min(orig_lon, dest_lon) - 0.5
-    max_lon = max(orig_lon, dest_lon) + 0.5
+    for s in (stations or []):
+        sid = s.get("id") or s.get("name") or str(s.get("lat",""))
+        if sid and sid not in charger_set:
+            charger_set[sid] = _normalize_nrel_station(s)
+
+    # Filter to DCFC only and within generous corridor bounding box
+    min_lat = min(orig_lat, dest_lat) - 1.5
+    max_lat = max(orig_lat, dest_lat) + 1.5
+    min_lon = min(orig_lon, dest_lon) - 1.5
+    max_lon = max(orig_lon, dest_lon) + 1.5
 
     dc_chargers = []
     for s in charger_set.values():
         if not s.get("lat") or not s.get("lon"):
             continue
-        clat, clon = float(s["lat"]), float(s["lon"])
+        try:
+            clat, clon = float(s["lat"]), float(s["lon"])
+        except (TypeError, ValueError):
+            continue
         if not (min_lat <= clat <= max_lat and min_lon <= clon <= max_lon):
             continue
+        # Accept if DCFC count > 0 OR if OSM source (ev_dc_fast_num may be 1 by default)
         if (s.get("ev_dc_fast_num") or 0) > 0:
             dc_chargers.append(s)
 
@@ -436,14 +469,21 @@ def plan_route(orig_lat, orig_lon, dest_lat, dest_lon, start_soc_pct,
 
     n = len(nodes)
 
-    # Dijkstra: (total_time_min, node_idx, soc_pct, path)
-    heap = [(0.0, 0, float(start_soc_pct), [])]
+    # Dijkstra: (total_time_min, counter, node_idx, soc_pct, path)
+    # counter breaks ties so dicts in path are never compared
+    _ctr = [0]
+    def push(heap, t, ni, soc, path):
+        _ctr[0] += 1
+        heapq.heappush(heap, (t, _ctr[0], ni, soc, path))
+
+    heap = []
+    push(heap, 0.0, 0, float(start_soc_pct), [])
     visited = {}
     best_result = None
     best_time = float("inf")
 
     while heap:
-        t, ci, soc, path = heapq.heappop(heap)
+        t, _, ci, soc, path = heapq.heappop(heap)
         if t > best_time:
             break
         key = (ci, round(soc, 1))
@@ -484,11 +524,11 @@ def plan_route(orig_lat, orig_lon, dest_lat, dest_lon, start_soc_pct,
 
             if nxt["type"] == "destination":
                 if arr_soc >= min_soc:
-                    heapq.heappush(heap, (t + drive_min, ni, arr_soc, cur_path))
+                    push(heap, t + drive_min, ni, arr_soc, cur_path)
             else:
                 # Option A: pass through without charging (if enough SOC)
                 if arr_soc >= target_charge_soc:
-                    heapq.heappush(heap, (t + drive_min, ni, arr_soc, cur_path))
+                    push(heap, t + drive_min, ni, arr_soc, cur_path)
                 # Option B: charge to target_charge_soc
                 if arr_soc < target_charge_soc:
                     ch_min = estimate_charge_time_min(
@@ -498,7 +538,7 @@ def plan_route(orig_lat, orig_lon, dest_lat, dest_lon, start_soc_pct,
                             specs["max_dc_kw"]
                         )
                     )
-                    heapq.heappush(heap, (t + drive_min + ch_min, ni, target_charge_soc, cur_path))
+                    push(heap, t + drive_min + ch_min, ni, target_charge_soc, cur_path)
 
     if not best_result:
         # Direct drive fallback
